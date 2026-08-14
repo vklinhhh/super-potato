@@ -56,6 +56,7 @@ from vbio.clients.mcap_client import MCAPClient, MCAPRequestError, parse_vehicle
 from vbio.clients.query_vbio import VBIoClient
 from vbio.clients.redis_store import InMemoryAssociationStore
 from vbio.enrichment.engine import Detection, EnrichmentEngine, EnrichmentResult
+from vbio.enrichment.keys import normalize_model_key
 
 
 class VehicleLookupService:
@@ -160,12 +161,29 @@ class VehicleLookupService:
         and the VBIo parquet file itself is never written to either way).
         """
         engine = self.engine or EnrichmentEngine(InMemoryAssociationStore())
+        top_k_confidences = {}
+        for row in vehicle.get("makeModelTopK") or []:
+            if not isinstance(row, dict):
+                continue
+            conf = row.get("confidence")
+            if conf is None:
+                continue
+            key = normalize_model_key(row.get("make"), row.get("model"))
+            if key == "_":
+                continue
+            try:
+                conf_f = float(conf)
+            except (TypeError, ValueError):
+                continue
+            top_k_confidences[key] = max(top_k_confidences.get(key, float("-inf")), conf_f)
+
         detection = Detection(
             plate_number=plate,
             plate_state=state,
             make=vehicle.get("make"),
             model=vehicle.get("model"),
             confidence=vehicle.get("makeModelConfidence"),
+            top_k_confidences=top_k_confidences,
             timestamp=datetime.now(timezone.utc),
         )
         result: EnrichmentResult = engine.process_detection(detection, vbio_seed_fn=self.vbio_client.lookup)

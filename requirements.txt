@@ -1,0 +1,13 @@
+# Runtime dependencies
+duckdb
+pyarrow
+requests
+redis
+google-auth
+numpy
+opencv-python
+scipy
+
+# Test dependencies
+fakeredis
+pytest

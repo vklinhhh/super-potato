@@ -34,7 +34,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -219,6 +219,78 @@ class MCAPClient:
         return self.analyze_images([image_path], payload=payload, query_params=query_params)
 
 
+def _as_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_make_model_pair(item: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    make = item.get("make") or item.get("Make")
+    model = item.get("model") or item.get("Model")
+    if make and model:
+        return str(make), str(model)
+
+    combined = item.get("makeModel") or item.get("label")
+    if isinstance(combined, str) and "," in combined:
+        left, right = combined.split(",", 1)
+        make = left.strip()
+        model = right.strip()
+        return (make or None), (model or None)
+    return None, None
+
+
+def _extract_make_model_rankings(attrs: Dict[str, Any], rankings: Dict[str, Any]) -> tuple[Optional[float], List[Dict[str, Any]]]:
+    """
+    Backward-compatible extractor for both:
+      - current payloads: rankings.makeModel = <float top-1 confidence>
+      - future payloads: ranked make/model lists under a list-valued field.
+    """
+    top1_conf = _as_float(rankings.get("makeModel"))
+
+    ranked_lists: List[List[Dict[str, Any]]] = []
+    for source in (rankings, attrs):
+        if not isinstance(source, dict):
+            continue
+        for key in ("makeModel", "makeModelTopK", "makeModelRankings", "makeModelCandidates", "topK"):
+            value = source.get(key)
+            if isinstance(value, list):
+                ranked_lists.append([v for v in value if isinstance(v, dict)])
+
+    by_pair: Dict[tuple[str, str], float] = {}
+    for ranked in ranked_lists:
+        for item in ranked:
+            make, model = _parse_make_model_pair(item)
+            conf = _as_float(item.get("confidence"))
+            if conf is None:
+                conf = _as_float(item.get("score"))
+            if conf is None or not make or not model:
+                continue
+            pair = (make, model)
+            if pair not in by_pair or conf > by_pair[pair]:
+                by_pair[pair] = conf
+
+    top_k = [
+        {"make": make, "model": model, "confidence": conf}
+        for (make, model), conf in by_pair.items()
+    ]
+    top_k.sort(key=lambda x: x["confidence"], reverse=True)
+
+    if top1_conf is None and top_k:
+        attrs_make = attrs.get("make")
+        attrs_model = attrs.get("model")
+        if attrs_make and attrs_model:
+            for row in top_k:
+                if row["make"] == attrs_make and row["model"] == attrs_model:
+                    top1_conf = row["confidence"]
+                    break
+        if top1_conf is None:
+            top1_conf = top_k[0]["confidence"]
+
+    return top1_conf, top_k
+
+
 def parse_vehicles(result: Dict[str, Any]) -> list:
     """
     Flatten a raw MCAP response (as returned by MCAPClient.analyze_image/analyze_images)
@@ -230,6 +302,7 @@ def parse_vehicles(result: Dict[str, Any]) -> list:
             "model": "Sonata",
             "makeModel": "Hyundai, Sonata",
             "makeModelConfidence": 0.93,
+            "makeModelTopK": [{"make": "Hyundai", "model": "Sonata", "confidence": 0.93}, ...],
             "vehicleType": "sedan",
             "color": ["white"],
             "boundingBox": {"x1": ..., "y1": ..., "x2": ..., "y2": ...},
@@ -254,6 +327,7 @@ def parse_vehicles(result: Dict[str, Any]) -> list:
         for idx, vehicle in enumerate(frame.get("vehicles", []) or []):
             attrs = vehicle.get("attributes", {}) or {}
             rankings = attrs.get("rankings", {}) or {}
+            make_model_conf, make_model_top_k = _extract_make_model_rankings(attrs, rankings)
 
             plate = plates_by_vehicle_id.get(idx)
             plate_attrs = (plate.get("attributes", {}) or {}) if plate else {}
@@ -268,7 +342,8 @@ def parse_vehicles(result: Dict[str, Any]) -> list:
                 "make": attrs.get("make"),
                 "model": attrs.get("model"),
                 "makeModel": attrs.get("makeModel"),
-                "makeModelConfidence": rankings.get("makeModel"),
+                "makeModelConfidence": make_model_conf,
+                "makeModelTopK": make_model_top_k,
                 "vehicleType": attrs.get("vehicleType"),
                 "color": attrs.get("color"),
                 "boundingBox": vehicle.get("boundingBox"),
