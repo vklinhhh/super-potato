@@ -1,0 +1,67 @@
+{
+    "dev": {
+        "es": {
+            "url": "https://cie-eaad-mcap2-use1.dev.commandcentral.com",
+            "token": "",
+            "dataStreamNames": [
+                "msi-search-staging-ingest-1day-0.6",
+                "msi-search-staging-ingest-14day-0.6",
+                "msi-search-staging-ingest-21day-0.6",
+                "msi-search-staging-ingest-30day-0.6",
+                "msi-search-staging-ingest-60day-0.6",
+                "msi-search-staging-ingest-90day-0.6"
+            ]
+
+        },
+        "mcap": {
+            "url": "https://mcap-api.int.calipsa.info/perception/analyzer/frames",
+            "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjBmNGY2ZDA5LTY5MDEtNDMxYi1hYjE5LWFiNGM5MWRmNzE4NSIsInVzZXJJZCI6IjczYTkzYzVkLTY0MTMtNDBkNC1hOGExLTNhNGVjMTk4OWEyYSIsInRva2VuVHlwZSI6ImNhbGlwc2EtYXBpIiwiaWF0IjoxNzg1NDM4MjY3LCJleHAiOjE3ODgwMzAyNjd9.vgz7qbc5aO703zwDF5iFpS-eoRuBUvmFL1whjmw1yjY"
+        },
+        "sqlServer": {
+            "user": "",
+            "password": "",
+            "server": "",
+            "database": "",
+            "options": {
+                "encrypt": true,
+                "trustServerCertificate": true
+            }
+        },
+            "redis": {
+      "url": "redis://10.128.15.203:6379/0",
+      "cluster": true,
+      "tlsCaCert": null,
+      "iamAuth": false
+    }
+  },
+  "stage": {
+    "es": {
+            "url": "https://cie-eaad-mcap2-use1.dev.commandcentral.com",
+            "token": "",
+            "dataStreamNames": [
+                "msi-search-integration-ingest-1day-0.6",
+                "msi-search-integration-ingest-14day-0.6",
+                "msi-search-integration-ingest-21day-0.6",
+                "msi-search-integration-ingest-30day-0.6",
+                "msi-search-integration-ingest-60day-0.6",
+                "msi-search-integration-ingest-90day-0.6"
+            ]
+
+        },
+        "mcap": {
+            "url": "https://mcap-api.int.calipsa.info/perception/analyzer/frames",
+            "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjBmNGY2ZDA5LTY5MDEtNDMxYi1hYjE5LWFiNGM5MWRmNzE4NSIsInVzZXJJZCI6IjczYTkzYzVkLTY0MTMtNDBkNC1hOGExLTNhNGVjMTk4OWEyYSIsInRva2VuVHlwZSI6ImNhbGlwc2EtYXBpIiwiaWF0IjoxNzg1NDM4MjY3LCJleHAiOjE3ODgwMzAyNjd9.vgz7qbc5aO703zwDF5iFpS-eoRuBUvmFL1whjmw1yjY"
+        },
+        "sqlServer": {
+            "user": "",
+            "password": "",
+            "server": "",
+            "database": "",
+            "options": {
+                "encrypt": true,
+                "trustServerCertificate": true
+            }
+        }
+
+  }
+}
