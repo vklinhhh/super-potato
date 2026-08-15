@@ -1,0 +1,16 @@
+body { background: #f4f7fb; color: #152033; font: 16px system-ui, sans-serif; margin: 0; }
+main { background: white; box-shadow: 0 5px 24px #0002; margin: 3rem auto; max-width: 780px; padding: 2rem; }
+form { display: grid; gap: 1rem; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+label { display: grid; font-weight: 600; gap: .4rem; } input, button { font: inherit; padding: .55rem; }
+button { background: #0969da; border: 0; color: white; cursor: pointer; grid-column: span 2; }
+.danger-zone { border-top: 1px solid #d8dee9; margin-top: 2rem; padding-top: 1rem; }
+.danger-zone label { margin-bottom: 1rem; max-width: 22rem; }
+button.danger { background: #cf222e; }
+dl { display: grid; grid-template-columns: 11rem 1fr; } dt { font-weight: 700; } dd { margin: 0 0 .55rem; }
+table { border-collapse: collapse; width: 100%; } th, td { border-bottom: 1px solid #d8dee9; padding: .5rem; text-align: left; }
+pre { overflow: auto; white-space: pre-wrap; } #status { min-height: 1.5rem; }
+.image-grid { display: grid; gap: 1rem; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+figure { margin: 0; } figcaption { font-weight: 700; margin-bottom: .4rem; }
+canvas, #plate-preview { border: 1px solid #d8dee9; display: block; max-height: 420px; max-width: 100%; object-fit: contain; }
+@media (max-width: 600px) { main { margin: 0; } form { grid-template-columns: 1fr; } button { grid-column: auto; } }
+@media (max-width: 600px) { .image-grid { grid-template-columns: 1fr; } }

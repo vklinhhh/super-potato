@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VBIo Vehicle Lookup</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main>
+    <h1>VBIo Vehicle Lookup</h1>
+    <p>Submit an authoritative plate key, its crop, and the overview image. MCAP analyzes the overview; Redis stores enrichment evidence.</p>
+    <form id="lookup-form">
+      <label>Plate number <input name="plateNumber" required autocomplete="off" placeholder="KEY123"></label>
+      <label>Plate state <input name="plateState" required maxlength="2" autocomplete="off" placeholder="CA"></label>
+      <label>Overview image <input name="overview" type="file" accept="image/*" required></label>
+      <label>Plate crop <input name="plateImage" type="file" accept="image/*" required></label>
+      <button type="submit">Lookup vehicle</button>
+    </form>
+    <section class="danger-zone">
+      <h2>Test controls</h2>
+      <p>Resetting permanently removes every dev association and score.</p>
+      <label>Type <code>RESET DEV REDIS</code> to confirm
+        <input id="reset-confirmation" autocomplete="off" placeholder="RESET DEV REDIS">
+      </label>
+      <button id="reset-redis" class="danger" type="button">Reset dev Redis</button>
+    </section>
+    <p id="status" role="status"></p>
+    <section id="visualisation" hidden>
+      <h2>Input visualisation</h2>
+      <div class="image-grid">
+        <figure>
+          <figcaption>Overview image</figcaption>
+          <canvas id="overview-canvas"></canvas>
+        </figure>
+        <figure>
+          <figcaption>Plate crop</figcaption>
+          <img id="plate-preview" alt="Submitted plate crop">
+        </figure>
+      </div>
+    </section>
+    <section id="result" hidden>
+      <h2>Result</h2>
+      <dl id="summary"></dl>
+      <h3>Redis-enriched candidates</h3>
+      <table><thead><tr><th>Make</th><th>Model</th><th>Score</th><th>Posterior</th><th>Observations</th></tr></thead><tbody id="candidates"></tbody></table>
+      <details><summary>Full response</summary><pre id="raw"></pre></details>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

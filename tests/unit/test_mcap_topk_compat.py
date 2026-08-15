@@ -2,7 +2,9 @@ import sys
 import types
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 # vehicle_lookup_service imports query_vbio, which imports duckdb at module-load time.
 # Stub it so this unit test can run in minimal environments.
@@ -11,6 +13,7 @@ if "duckdb" not in sys.modules:
 
 from vbio.clients.mcap_client import parse_vehicles
 from vbio.enrichment.engine import EnrichmentResult
+from vbio import vehicle_lookup_service as lookup_module
 from vbio.vehicle_lookup_service import VehicleLookupService
 
 
@@ -106,6 +109,76 @@ def test_vehicle_lookup_service_passes_topk_to_enrichment_detection():
     assert engine.last_detection is not None
     assert engine.last_detection.top_k_confidences["hyundai_sonata"] == 0.80
     assert engine.last_detection.top_k_confidences["mercedes-benz_cclass"] == 0.15
+
+
+def test_component_pipeline_matches_plate_to_vehicle_before_enrichment(monkeypatch):
+    raw_mcap = {
+        "data": {"attributes": {"analytics": {"vehicleAnalysis": [{
+            "vehicles": [
+                {"attributes": {"make": "Honda", "model": "Accord", "makeModel": "Honda, Accord",
+                                "rankings": {"makeModel": 0.91}}, "details": [],
+                 "boundingBox": {"x1": 0.05, "y1": 0.1, "x2": 0.45, "y2": 0.9}},
+                {"attributes": {"make": "Toyota", "model": "Camry", "makeModel": "Toyota, Camry",
+                                "rankings": {"makeModel": 0.95}}, "details": [],
+                 "boundingBox": {"x1": 0.55, "y1": 0.1, "x2": 0.95, "y2": 0.9}},
+            ],
+            "plates": [
+                {"vehicleId": 0, "boundingBox": {"x1": 0.15, "y1": 0.5, "x2": 0.3, "y2": 0.6},
+                 "attributes": {"text": "OTHER1", "state": "NY"}},
+                {"vehicleId": 1, "boundingBox": {"x1": 0.65, "y1": 0.5, "x2": 0.8, "y2": 0.6},
+                 "attributes": {"text": "KEY123", "state": "NY"}},
+            ],
+        }]}}}
+    }
+
+    class MCAP:
+        def analyze_image(self, image_path, payload=None):
+            assert image_path == "overview.jpg"
+            return raw_mcap
+
+    class VBIo:
+        def __init__(self):
+            self.lookups = []
+
+        def lookup(self, plate, state):
+            self.lookups.append((plate, state))
+            return []
+
+    engine, vbio = _CaptureEngine(), VBIo()
+    service = VehicleLookupService(MCAP(), vbio, engine=engine)
+    monkeypatch.setattr(lookup_module.cv2, "imread", lambda _: np.zeros((100, 100, 3), dtype=np.uint8))
+
+    result = service.lookup_from_components("KEY123", "CA", "plate.jpg", "overview.jpg")
+
+    assert result["error"] is None
+    assert result["plate_match"]["vehicle_id"] == 1
+    assert result["mcap"]["makeModel"] == "Toyota, Camry"
+    assert result["vbio_query"] == {"plate": "KEY123", "plateState": "CA"}
+    assert vbio.lookups == [("KEY123", "CA")]
+    assert engine.last_detection.plate_number == "KEY123"
+    assert engine.last_detection.plate_state == "CA"
+    assert engine.last_detection.make == "Toyota"
+
+
+def test_component_pipeline_uses_whole_image_when_mcap_detects_no_vehicle(monkeypatch):
+    raw_mcap = {"data": {"attributes": {"analytics": {"vehicleAnalysis": [{
+        "vehicles": [], "plates": [],
+    }]}}}}
+
+    class MCAP:
+        def analyze_image(self, *_args, **_kwargs):
+            return raw_mcap
+
+    engine = _CaptureEngine()
+    service = VehicleLookupService(MCAP(), _NoopVBIoClient(), engine=engine)
+    monkeypatch.setattr(lookup_module.cv2, "imread", lambda _: np.zeros((100, 100, 3), dtype=np.uint8))
+
+    result = service.lookup_from_components("KEY123", "CA", "plate.jpg", "overview.jpg")
+
+    assert result["error"] is None
+    assert result["plate_match"]["phase"] == "whole_image_fallback"
+    assert result["mcap"]["boundingBox"] == {"x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0}
+    assert engine.last_detection.make is None
 
 
 if __name__ == "__main__":

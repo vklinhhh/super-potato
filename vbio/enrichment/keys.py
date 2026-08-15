@@ -22,8 +22,9 @@ def normalize_model_key(make: Optional[str], model: Optional[str]) -> str:
 
 
 def make_from_key(key: str) -> str:
-    """Extracts the make portion of a normalized model key ('ford_flex' -> 'ford')."""
-    return key.split("_", 1)[0]
+    """Extracts the make from a normalized or plate-scoped Redis candidate key."""
+    model_key = key.rsplit(":", 1)[-1]
+    return model_key.split("_", 1)[0]
 
 
 def build_redis_key(plate_number: str, plate_state: str, make: str, model: str) -> str:

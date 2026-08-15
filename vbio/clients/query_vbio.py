@@ -44,8 +44,7 @@ class VBIoClient:
             WHERE UPPER(PlateNumber) = UPPER(?)
               AND UPPER(PlateState) = UPPER(?)
         """
-        df = duckdb.query(query, params=[plate, plate_state]).df()
-        return df.to_dict(orient="records")
+        return self._query_records(query, [plate, plate_state])
 
     def lookup_plate_only(self, plate: str):
         """Look up all VBIo records matching a plate number, across all states."""
@@ -54,8 +53,14 @@ class VBIoClient:
             FROM '{self.parquet_file}'
             WHERE UPPER(PlateNumber) = UPPER(?)
         """
-        df = duckdb.query(query, params=[plate]).df()
-        return df.to_dict(orient="records")
+        return self._query_records(query, [plate])
+
+    @staticmethod
+    def _query_records(query: str, params: list):
+        """Return DuckDB rows as dictionaries without requiring pandas."""
+        cursor = duckdb.execute(query, parameters=params)
+        columns = [column[0] for column in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
 def _main():

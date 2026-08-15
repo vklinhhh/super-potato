@@ -56,14 +56,10 @@ enrichment together end-to-end.
 ## Setup
 
 ```bash
-pip install duckdb pyarrow requests redis --break-system-packages
+pip install -r requirements.txt --break-system-packages
 ```
 
-`fakeredis` is only needed to run the test suite without a live Redis server:
-
-```bash
-pip install fakeredis pytest --break-system-packages
-```
+`requirements.txt` includes both runtime and test dependencies.
 
 All commands below assume you're running from the `poc/` root (needed so the `vbio`
 package resolves via `python -m`). The `scripts/` wrappers work from anywhere.

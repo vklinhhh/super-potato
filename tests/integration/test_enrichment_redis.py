@@ -1,22 +1,20 @@
 """
 test_enrichment_engine.py
 
-Regression tests for the enrichment engine, checking it reproduces the tier semantics
-documented in simulation_hmm.html ("Confidence tier of the returned result" comment):
+Integration tests for the Redis-backed enrichment engine:
     OBSERVED — clean read, engine trusted directly (conf >= Th1)
     HIGH     — Bayes clears Th3 and the winner is alive in Redis
     MEDIUM   — inferred from A*'s make: highest-scoring same-make record
     LOW      — registry only: highest-scoring record on the whole plate
     NONE     — no record alive, return Unknown
 
-Run with: python -m pytest tests/test_enrichment_engine.py -v
-(or just: python tests/test_enrichment_engine.py)
+Run with: python -m pytest tests/integration/test_enrichment_redis.py -v
 """
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import fakeredis
 

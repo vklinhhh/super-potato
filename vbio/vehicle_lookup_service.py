@@ -48,6 +48,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import cv2
+
 # Makes `from vbio.clients... import ...` resolve even when this file is run directly
 # (e.g. `python vbio/vehicle_lookup_service.py ...`) rather than via `python -m`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -57,6 +59,7 @@ from vbio.clients.query_vbio import VBIoClient
 from vbio.clients.redis_store import InMemoryAssociationStore
 from vbio.enrichment.engine import Detection, EnrichmentEngine, EnrichmentResult
 from vbio.enrichment.keys import normalize_model_key
+from vbio.plate_matching.matcher import match as match_plate_to_vehicle
 
 
 class VehicleLookupService:
@@ -131,6 +134,89 @@ class VehicleLookupService:
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Run the pipeline separately for each image path; keeps results grouped by image."""
         return {path: self.lookup_from_image(path, payload=payload) for path in image_paths}
+
+    def lookup_from_components(
+        self,
+        plate_number: str,
+        plate_state: str,
+        plate_image_path: str,
+        overview_image_path: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Resolve one explicitly keyed plate observation from its crop and overview image.
+
+        MCAP receives only ``overview_image_path``. The supplied plate number/state are
+        authoritative for VBIo lookup and Redis scoring; MCAP plate OCR is evidence used
+        solely to identify which detected vehicle owns the crop.
+        """
+        try:
+            mcap_result = self.mcap_client.analyze_image(overview_image_path, payload=payload)
+        except MCAPRequestError as exc:
+            return self._component_error(plate_number, plate_state, f"MCAP request failed: {exc}")
+
+        overview_image = cv2.imread(overview_image_path)
+        plate_image = cv2.imread(plate_image_path)
+        if overview_image is None:
+            return self._component_error(plate_number, plate_state, f"Could not read overview image: {overview_image_path}")
+        if plate_image is None:
+            return self._component_error(plate_number, plate_state, f"Could not read plate image: {plate_image_path}")
+
+        plate_match = match_plate_to_vehicle(
+            overview_image,
+            plate_image,
+            mcap_result,
+            target_text=plate_number,
+            whole_image_fallback=True,
+        )
+        vehicle_id = plate_match["vehicle_id"]
+        if vehicle_id is None:
+            return {
+                **self._component_error(plate_number, plate_state, "Plate could not be matched to a detected vehicle."),
+                "mcap": None,
+                "plate_match": plate_match,
+            }
+
+        vehicles = parse_vehicles(mcap_result)
+        if plate_match["phase"] == "whole_image_fallback":
+            vehicle = {
+                "make": None,
+                "model": None,
+                "makeModel": "Whole image (MCAP vehicle unavailable)",
+                "makeModelConfidence": None,
+                "makeModelTopK": [],
+                "boundingBox": {"x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0},
+            }
+        elif vehicle_id >= len(vehicles):
+            return {
+                **self._component_error(plate_number, plate_state, f"Matched vehicle index {vehicle_id} is absent from parsed MCAP output."),
+                "mcap": None,
+                "plate_match": plate_match,
+            }
+        else:
+            vehicle = vehicles[vehicle_id]
+        matches = self.vbio_client.lookup(plate_number, plate_state)
+        return {
+            "key": {"plate": plate_number, "plateState": plate_state},
+            "mcap": vehicle,
+            "plate_match": plate_match,
+            "vbio_query": {"plate": plate_number, "plateState": plate_state},
+            "vbio_matches": matches,
+            "enrichment": self._run_enrichment(vehicle, plate_number, plate_state),
+            "error": None,
+        }
+
+    @staticmethod
+    def _component_error(plate_number: str, plate_state: str, error: str) -> Dict[str, Any]:
+        return {
+            "key": {"plate": plate_number, "plateState": plate_state},
+            "mcap": None,
+            "plate_match": None,
+            "vbio_query": None,
+            "vbio_matches": [],
+            "enrichment": None,
+            "error": error,
+        }
 
     def _resolve_vehicle(self, vehicle: Dict[str, Any]) -> Dict[str, Any]:
         plate = vehicle.get("plateText")
@@ -210,7 +296,10 @@ class VehicleLookupService:
 
 def _main():
     parser = argparse.ArgumentParser(description="MCAP -> plate/state -> VBIo lookup -> enrichment pipeline.")
-    parser.add_argument("images", nargs="+", help="Path(s) to image file(s) to analyze")
+    parser.add_argument("images", nargs="+", help="Overview image path(s) to analyze")
+    parser.add_argument("--plate-number", help="Authoritative plate number for component matching")
+    parser.add_argument("--plate-state", help="Authoritative plate state for component matching")
+    parser.add_argument("--plate-image", help="Plate crop image for component matching")
     parser.add_argument("--config", default="default.json", help="Path to MCAP/Redis config json")
     parser.add_argument("--env", default="dev", choices=["dev", "stage", "prod"], help="Environment (MCAP + Redis)")
     parser.add_argument("--token", default=None, help="MCAP bearer token (else MCAP_TOKEN env var or config)")
@@ -224,23 +313,44 @@ def _main():
         help="Persist enrichment state to the Redis instance configured for --env, instead of "
              "the default disposable in-memory store (which forgets everything after this run).",
     )
+    parser.add_argument(
+        "--redis-only", action="store_true",
+        help="Read Redis candidates first; seed a cache miss from the local VBIo parquet.",
+    )
     parser.add_argument("--out", default=None, help="Optional path to save the JSON result")
     args = parser.parse_args()
 
+    if args.redis_only and not args.use_redis:
+        parser.error("--redis-only requires --use-redis")
+
     engine = None
+    vbio_client = VBIoClient(args.parquet)
     if args.use_redis:
         from vbio.clients.redis_connection import build_redis_client_for_env
         from vbio.clients.redis_store import RedisAssociationStore
         redis_client = build_redis_client_for_env(env=args.env, config_path=args.config)
-        engine = EnrichmentEngine(RedisAssociationStore(redis_client))
+        redis_store = RedisAssociationStore(redis_client)
+        engine = EnrichmentEngine(redis_store)
+        if args.redis_only:
+            from vbio.clients.redis_vbio import RedisVBIoClient
+            vbio_client = RedisVBIoClient(redis_store, cold_start_client=vbio_client)
 
     service = VehicleLookupService(
         mcap_client=MCAPClient(config_path=args.config, env=args.env, token=args.token),
-        vbio_client=VBIoClient(args.parquet),
+        vbio_client=vbio_client,
         engine=engine,
     )
 
-    if len(args.images) == 1:
+    component_args = (args.plate_number, args.plate_state, args.plate_image)
+    if any(component_args):
+        if not all(component_args):
+            parser.error("--plate-number, --plate-state, and --plate-image must be supplied together")
+        if len(args.images) != 1:
+            parser.error("component matching accepts exactly one overview image")
+        result = service.lookup_from_components(
+            args.plate_number, args.plate_state, args.plate_image, args.images[0]
+        )
+    elif len(args.images) == 1:
         result = service.lookup_from_image(args.images[0])
     else:
         result = service.lookup_from_images(args.images)
