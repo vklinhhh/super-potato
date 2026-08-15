@@ -1,7 +1,7 @@
 # Python bytecode / cache
 __pycache__/
 *.py[cod]
-
+*.pyc
 # Test/cache tooling
 .pytest_cache/
 .venv/

@@ -125,7 +125,20 @@ class EnrichmentEngine:
             # NOTE: this must be the same full, plate-scoped key format used for every
             # record's "key" field (build_redis_key), NOT the bare normalize_model_key --
             # otherwise it can never match an existing candidate's "key".
-            top_key = build_redis_key(detection.plate_number, detection.plate_state, detection.make, detection.model)
+            canonical_top_key = build_redis_key(
+                detection.plate_number, detection.plate_state, detection.make, detection.model
+            )
+            # Existing Redis hashes may have been written using an older key
+            # normalizer. Match their record fields canonically before admitting a
+            # duplicate candidate under the new canonical key.
+            top_key = next(
+                (
+                    record["key"] for record in records
+                    if normalize_model_key(record["make"], record["model"])
+                    == normalize_model_key(detection.make, detection.model)
+                ),
+                canonical_top_key,
+            )
 
         # Admit a brand-new candidate from a Th1-passing read that isn't in Redis yet.
         if is_mmc_detected and top_key and not any(r["key"] == top_key for r in records):

@@ -108,7 +108,7 @@ def test_vehicle_lookup_service_passes_topk_to_enrichment_detection():
 
     assert engine.last_detection is not None
     assert engine.last_detection.top_k_confidences["hyundai_sonata"] == 0.80
-    assert engine.last_detection.top_k_confidences["mercedes-benz_cclass"] == 0.15
+    assert engine.last_detection.top_k_confidences["mercedesbenz_cclass"] == 0.15
 
 
 def test_component_pipeline_matches_plate_to_vehicle_before_enrichment(monkeypatch):

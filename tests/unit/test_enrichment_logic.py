@@ -12,6 +12,7 @@ from vbio.enrichment.posterior import (
     compute_transition_prior,
 )
 from vbio.enrichment.tiering import decide_tier
+from vbio.enrichment.keys import normalize_model_key
 
 
 def test_compute_pi_score_normalizes_live_scores():
@@ -20,6 +21,13 @@ def test_compute_pi_score_normalizes_live_scores():
 
     assert math.isclose(sum(pi.values()), 1.0, rel_tol=1e-9)
     assert pi["A"] > pi["B"]
+
+
+def test_normalize_model_key_merges_punctuation_and_spacing_variants():
+    assert normalize_model_key("Ford", "F-150") == "ford_f150"
+    assert normalize_model_key("FORD", "F 150") == "ford_f150"
+    assert normalize_model_key("Mercedes-Benz", "C-Class") == "mercedesbenz_cclass"
+    assert normalize_model_key("Mercedes Benz", "C Class") == "mercedesbenz_cclass"
 
 
 def test_compute_posteriors_selects_best_candidate_after_likelihood_update():

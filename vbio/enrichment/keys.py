@@ -7,17 +7,24 @@ plate-scoped key builder for a real (shared, global) Redis instance.
 This is the single source of truth for key logic -- vbio_redis_loader.py imports from
 here rather than defining its own copy.
 """
+import re
+import unicodedata
 from typing import Optional
+
+
+def _canonical_component(value: Optional[str]) -> str:
+    """Case-fold and remove spacing/punctuation without applying semantic aliases."""
+    text = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]", "", text.casefold())
 
 
 def normalize_model_key(make: Optional[str], model: Optional[str]) -> str:
     """
-    Python port of simulation_hmm.html's normalizeModelKey(make, model):
-        cleanMake  = lowercase, trimmed, internal whitespace runs -> '_'
-        cleanModel = lowercase, trimmed, spaces AND hyphens stripped out entirely
+    Canonical key for mechanical make/model spelling variants. Case, whitespace,
+    punctuation, and diacritics are removed; semantic aliases are deliberately not.
     """
-    clean_make = "_".join((make or "").lower().strip().split())
-    clean_model = "".join(ch for ch in (model or "").lower().strip() if not ch.isspace() and ch != "-")
+    clean_make = _canonical_component(make)
+    clean_model = _canonical_component(model)
     return f"{clean_make}_{clean_model}"
 
 
