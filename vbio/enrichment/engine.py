@@ -184,6 +184,12 @@ class EnrichmentEngine:
         t_same_dynamic = compute_t_same_dynamic(len(candidates), gap_days, cfg.t_same_base, cfg.lambda_base)
         pi_score = compute_pi_score(scores, cfg.eps_t)
         trans_p = compute_transition_prior(candidates, prev_posteriors, pi_score, t_same_dynamic)
+        transition_total = sum(trans_p.values())
+        trans_p = (
+            {key: value / transition_total for key, value in trans_p.items()}
+            if transition_total > 0
+            else pi_score
+        )
 
         # detection.top_k_confidences is naturally keyed by the bare "make_model" string
         # (e.g. from a top-5 prediction list, which has no notion of plate-scoped keys);
@@ -196,20 +202,27 @@ class EnrichmentEngine:
         }
         if top_key and detection.confidence is not None:
             top_k_confidences[top_key] = detection.confidence
-        likelihoods = compute_likelihoods(candidates, top_k_confidences, cfg.epsilon)
-
-        posteriors, best_candidate, max_posterior = compute_posteriors(candidates, likelihoods, trans_p)
-        for r in records:
-            r["posterior"] = posteriors[r["key"]]
+        has_ranked_mcap_candidates = len(top_k_confidences) > 1
+        if has_ranked_mcap_candidates:
+            likelihoods = compute_likelihoods(candidates, top_k_confidences, cfg.epsilon)
+            posteriors, best_candidate, max_posterior = compute_posteriors(candidates, likelihoods, trans_p)
 
         # --- 3. apply the observation itself ---
         if is_mmc_detected and top_key:
             apply_high_confidence_update(records, top_key, detection.confidence, now, cfg.malus_rate)
         elif detection.confidence is not None and top_key and any(r["key"] == top_key for r in records):
             winner = next(r for r in records if r["key"] == top_key)
-            apply_low_confidence_update(winner, detection.confidence, now, cfg.malus_low_rate)
+            apply_low_confidence_update(winner, detection.confidence, cfg.malus_low_rate)
 
         scores_after = {r["key"]: r["score"] for r in records}
+        if not has_ranked_mcap_candidates:
+            # The slide flow defines current evidence through score updates. For a
+            # top-1-only response, derive posterior directly from those decayed,
+            # updated Redis scores instead of inventing likelihoods for omitted models.
+            posteriors = compute_pi_score(scores_after, cfg.eps_t)
+            best_candidate, max_posterior = max(posteriors.items(), key=lambda item: item[1])
+        for r in records:
+            r["posterior"] = posteriors[r["key"]]
 
         # --- 4. pack the result ---
         tier_result: TierResult = decide_tier(

@@ -50,12 +50,12 @@ def apply_high_confidence_update(records: Iterable[dict], winner_key: str, confi
             r["score"] -= malus
 
 
-def apply_low_confidence_update(record: dict, confidence: float, now: datetime, malus_low_rate: float) -> None:
+def apply_low_confidence_update(record: dict, confidence: float, malus_low_rate: float) -> None:
     """
     conf < Th1 branch, only applied when the read's top candidate already exists in Redis:
-        winner.score += malus_low_rate * confidence; winner.lastSeen = now
+        winner.score += malus_low_rate * confidence
         (no malus to others, no admission of new candidates, observationCount unchanged --
-        a weak read is still a real sighting, but not a confirmed hit)
+        a weak read is activity only, not a confirmed sighting, so lastSeen is unchanged.
+        decay_all() has already refreshed lastDecayedAt for every candidate in this lookup.)
     """
     record["score"] += malus_low_rate * confidence
-    record["lastSeen"] = now

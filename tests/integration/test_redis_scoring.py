@@ -9,6 +9,7 @@ from vbio.clients.redis_store import RedisAssociationStore
 from vbio.enrichment.config import DEFAULT_CONFIG
 from vbio.enrichment.engine import Detection, EnrichmentEngine
 from vbio.enrichment.keys import build_redis_key
+from vbio.enrichment.posterior import compute_pi_score
 
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
 PLATE = "ABC123"
@@ -75,16 +76,25 @@ def test_high_confidence_update_boosts_winner_penalizes_rival_and_persists():
     decayed_winner = 2.0 * math.exp(-DEFAULT_CONFIG.lambda_base)
     decayed_rival = 4.0 * math.exp(-DEFAULT_CONFIG.lambda_base)
 
-    assert records["Camry"]["score"] == pytest.approx(decayed_winner + confidence)
+    expected_winner = decayed_winner + confidence
+    expected_rival = decayed_rival * (1 - DEFAULT_CONFIG.malus_rate * confidence)
+    assert records["Camry"]["score"] == pytest.approx(expected_winner)
     assert records["Camry"]["observationCount"] == 4
     assert records["Camry"]["lastSeen"] == NOW
     assert records["Accord"]["score"] == pytest.approx(
-        decayed_rival * (1 - DEFAULT_CONFIG.malus_rate * confidence)
+        expected_rival
     )
     assert records["Accord"]["observationCount"] == 7
+    keys = {model: record["key"] for model, record in records.items()}
+    expected_posterior = compute_pi_score(
+        {keys["Camry"]: expected_winner, keys["Accord"]: expected_rival},
+        DEFAULT_CONFIG.eps_t,
+    )
+    assert records["Camry"]["posterior"] == pytest.approx(expected_posterior[keys["Camry"]])
 
 
 def test_low_confidence_existing_candidate_adds_credit_without_rival_malus():
+    previous_last_seen = NOW - timedelta(days=1)
     engine, store = _engine_with_records([
         _record("Toyota", "Camry", 2.0, NOW, observation_count=3),
         _record("Honda", "Accord", 4.0, NOW, observation_count=7),
@@ -99,6 +109,26 @@ def test_low_confidence_existing_candidate_adds_credit_without_rival_malus():
 
     assert records["Camry"]["score"] == pytest.approx(2.0 + DEFAULT_CONFIG.malus_low_rate * confidence)
     assert records["Camry"]["observationCount"] == 3
-    assert records["Camry"]["lastSeen"] == NOW
+    assert records["Camry"]["lastSeen"] == previous_last_seen
+    assert records["Camry"]["lastDecayedAt"] == NOW
     assert records["Accord"]["score"] == pytest.approx(4.0)
     assert records["Accord"]["observationCount"] == 7
+    assert records["Accord"]["lastSeen"] == previous_last_seen
+    assert records["Accord"]["lastDecayedAt"] == NOW
+
+
+def test_lookup_only_refreshes_last_decayed_at_without_confirming_a_sighting():
+    previous_last_seen = NOW - timedelta(days=7)
+    record = _record("Toyota", "Camry", 2.0, NOW - timedelta(days=2))
+    record["lastSeen"] = previous_last_seen
+    engine, store = _engine_with_records([record])
+
+    engine.process_detection(Detection(
+        plate_number=PLATE, plate_state=STATE, timestamp=NOW,
+    ))
+    record = _by_model(store)["Camry"]
+
+    assert record["observationCount"] == 3
+    assert record["lastSeen"] == previous_last_seen
+    assert record["lastDecayedAt"] == NOW
+    assert record["score"] == pytest.approx(2.0 * math.exp(-DEFAULT_CONFIG.lambda_base * 2))
