@@ -11,9 +11,11 @@ Final tier decision, ported 1:1 from simulation_hmm.html's "PACK THE RESULT" ste
     NONE     — nothing alive on the plate at all: Unknown.
 """
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, Optional
 
 from .keys import make_from_key
+from .ranking import pick_best_key
 
 
 @dataclass
@@ -33,7 +35,15 @@ def decide_tier(
     max_posterior: float,
     scores: Dict[str, float],
     th3: float,
+    recency: Optional[Dict[str, datetime]] = None,
 ) -> TierResult:
+    """
+    :param recency: optional {candidate_key: lastSeen} tie-break for the MEDIUM/LOW
+        rescue picks below -- e.g. two VBIo-seeded candidates that never get
+        reinforced by a real detection decay identically forever, so without this
+        the rescue would silently pick whichever happened to load first instead of
+        the one actually registered/seen more recently.
+    """
     if is_mmc_detected:
         return TierResult(branch="direct", tier="OBSERVED", result_key=top_key)
 
@@ -49,14 +59,14 @@ def decide_tier(
         make = make_from_key(best_candidate)
         same_make = [k for k in active_all if make_from_key(k) == make]
         if same_make:
-            rescued = max(same_make, key=lambda k: scores[k])
+            rescued = pick_best_key({k: scores[k] for k in same_make}, recency)
             return TierResult(
                 branch="hmm-bayes", tier="MEDIUM", result_key=rescued,
                 rescued_by_registry_fallback=True,
             )
 
     if active_all:
-        rescued = max(active_all, key=lambda k: scores[k])
+        rescued = pick_best_key({k: scores[k] for k in active_all}, recency)
         return TierResult(
             branch="hmm-bayes", tier="LOW", result_key=rescued,
             rescued_by_registry_fallback=True, rescued_by_top_score=True,

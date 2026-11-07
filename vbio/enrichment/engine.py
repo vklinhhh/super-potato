@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
+from .aliases import MakeModelAliases
 from .config import DEFAULT_CONFIG, EnrichmentConfig
 from .keys import build_redis_key, normalize_model_key
 from .posterior import (
@@ -71,13 +72,31 @@ VBIoSeedFn = Callable[[str, str], List[dict]]
 
 
 class EnrichmentEngine:
-    def __init__(self, redis_store, config: EnrichmentConfig = DEFAULT_CONFIG):
+    def __init__(
+        self,
+        redis_store,
+        config: EnrichmentConfig = DEFAULT_CONFIG,
+        aliases: Optional[MakeModelAliases] = None,
+    ):
         """
         :param redis_store: a RedisAssociationStore (see clients/redis_store.py) --
                              handles reading/writing the plate's candidate records.
+        :param aliases: optional MakeModelAliases (see vbio.clients.make_model_mapping
+                         for the loader) -- resolves every make/model this engine sees
+                         (both VBIo seed rows and MCAP detections) to its canonical
+                         spelling BEFORE building a candidate key, so e.g. a VBIo seed
+                         spelled "GR Supra" and a MCAP detection spelled "Supra" land on
+                         the SAME candidate instead of splitting evidence across two.
+                         If omitted, make/model pass through unchanged (old behavior).
         """
         self.store = redis_store
         self.config = config
+        self.aliases = aliases
+
+    def _canonicalize(self, make: Optional[str], model: Optional[str]):
+        if self.aliases is None:
+            return make, model
+        return self.aliases.canonicalize(make, model)
 
     def process_detection(self, detection: Detection, vbio_seed_fn: Optional[VBIoSeedFn] = None,
                            dry_run: bool = False) -> EnrichmentResult:
@@ -90,6 +109,12 @@ class EnrichmentEngine:
         cfg = self.config
         now = detection.timestamp or datetime.now(timezone.utc)
 
+        # Canonicalize once, up front -- every subsequent use of "the detection's
+        # make/model" in this method uses det_make/det_model, never
+        # detection.make/detection.model directly, so seed rows (VBIo spelling) and
+        # this detection (MCAP spelling) are compared/keyed in the same vocabulary.
+        det_make, det_model = self._canonicalize(detection.make, detection.model)
+
         # gapDays uses the PREVIOUS plate-level detection time, read before anything else
         # is touched -- matches computeHMMSequence() reading `lastUpdate` at the very top
         # of each loop iteration, before decay/admission/posterior for that tick.
@@ -101,13 +126,14 @@ class EnrichmentEngine:
         # Cold start: nothing in Redis yet for this plate -- admit VBIo/VBIo seed rows.
         if not records and vbio_seed_fn is not None:
             for seed in vbio_seed_fn(detection.plate_number, detection.plate_state):
-                key = build_redis_key(detection.plate_number, detection.plate_state, seed["Make"], seed["Model"])
+                seed_make, seed_model = self._canonicalize(seed["Make"], seed["Model"])
+                key = build_redis_key(detection.plate_number, detection.plate_state, seed_make, seed_model)
                 records.append({
                     "key": key,
                     "plateNumber": detection.plate_number,
                     "plateState": detection.plate_state,
-                    "make": seed["Make"],
-                    "model": seed["Model"],
+                    "make": seed_make,
+                    "model": seed_model,
                     "firstSeen": seed.get("FirstSeen") or now,
                     "lastSeen": seed.get("LastSeen") or now,
                     "lastDecayedAt": now,
@@ -120,13 +146,19 @@ class EnrichmentEngine:
                 })
 
         top_key = None
-        is_mmc_detected = detection.confidence is not None and detection.confidence >= cfg.th1
-        if detection.make and detection.model:
+        # A plate with no VBIo (DMV) backing at all has nothing to fall back on while
+        # waiting for a read to clear the full Th1 -- use the lower, no-DMV-backing
+        # threshold instead. Free to check: `records` (seed candidates included) is
+        # already loaded this tick, no extra storage/Redis round-trip.
+        has_vbio_candidate = any(r.get("source") == "VBIO" for r in records)
+        effective_th1 = cfg.th1 if has_vbio_candidate else cfg.th1_no_vbio
+        is_mmc_detected = detection.confidence is not None and detection.confidence >= effective_th1
+        if det_make and det_model:
             # NOTE: this must be the same full, plate-scoped key format used for every
             # record's "key" field (build_redis_key), NOT the bare normalize_model_key --
             # otherwise it can never match an existing candidate's "key".
             canonical_top_key = build_redis_key(
-                detection.plate_number, detection.plate_state, detection.make, detection.model
+                detection.plate_number, detection.plate_state, det_make, det_model
             )
             # Existing Redis hashes may have been written using an older key
             # normalizer. Match their record fields canonically before admitting a
@@ -135,10 +167,42 @@ class EnrichmentEngine:
                 (
                     record["key"] for record in records
                     if normalize_model_key(record["make"], record["model"])
-                    == normalize_model_key(detection.make, detection.model)
+                    == normalize_model_key(det_make, det_model)
                 ),
                 canonical_top_key,
             )
+
+        # "Late-arriving VBIo" rescue: if this detection's (make, model) isn't a
+        # candidate yet, check whether VBIo has since documented this exact
+        # association for the plate -- even if it wasn't visible yet at this plate's
+        # very first-ever cold-start (that only runs once, using whatever `now` was at
+        # the time). A plate transfer whose NEW vehicle's VBIo registration postdates
+        # this plate's first-ever processed detection would otherwise never be seeded
+        # at all, forcing it to wait for MCAP's own confidence to independently clear
+        # Th1 -- which can take months (see ENGINE_LOGIC_FLOW.md, HMU4444_NY case
+        # study). Only queries vbio_seed_fn when a genuinely unmatched (make, model)
+        # is seen; once admitted, this branch never re-fires for it.
+        if det_make and det_model and top_key and vbio_seed_fn is not None and not any(r["key"] == top_key for r in records):
+            for seed in vbio_seed_fn(detection.plate_number, detection.plate_state):
+                seed_make, seed_model = self._canonicalize(seed["Make"], seed["Model"])
+                if normalize_model_key(seed_make, seed_model) == normalize_model_key(det_make, det_model):
+                    records.append({
+                        "key": top_key,
+                        "plateNumber": detection.plate_number,
+                        "plateState": detection.plate_state,
+                        "make": seed_make,
+                        "model": seed_model,
+                        "firstSeen": seed.get("FirstSeen") or now,
+                        "lastSeen": seed.get("LastSeen") or now,
+                        "lastDecayedAt": now,
+                        "observationCount": seed.get("ObservationCount", 0),
+                        "score": cfg.seed_base * (seed.get("HmmPosterior") or 1.0),
+                        "posterior": cfg.epsilon,
+                        "hmmPosterior": seed.get("HmmPosterior"),
+                        "status": seed.get("Status"),
+                        "source": "VBIO",
+                    })
+                    break
 
         # Admit a brand-new candidate from a Th1-passing read that isn't in Redis yet.
         if is_mmc_detected and top_key and not any(r["key"] == top_key for r in records):
@@ -146,8 +210,8 @@ class EnrichmentEngine:
                 "key": top_key,
                 "plateNumber": detection.plate_number,
                 "plateState": detection.plate_state,
-                "make": detection.make,
-                "model": detection.model,
+                "make": det_make,
+                "model": det_model,
                 "firstSeen": now,
                 "lastSeen": now,
                 "lastDecayedAt": now,
@@ -179,6 +243,12 @@ class EnrichmentEngine:
         candidates = [r["key"] for r in records]
         scores = {r["key"]: r["score"] for r in records}
         prev_posteriors = {r["key"]: r["posterior"] for r in records}
+        # Tie-break for every argmax below: two candidates landing on the exact same
+        # score/posterior most commonly means neither has ever been reinforced by a
+        # real detection (e.g. two VBIo seeds that just decay in lockstep forever) --
+        # prefer whichever was actually seen more recently over whichever happened to
+        # load first.
+        recency = {r["key"]: r.get("lastSeen") for r in records}
 
         # --- 2. prior / likelihood / posterior ---
         t_same_dynamic = compute_t_same_dynamic(len(candidates), gap_days, cfg.t_same_base, cfg.lambda_base)
@@ -202,25 +272,50 @@ class EnrichmentEngine:
         }
         if top_key and detection.confidence is not None:
             top_k_confidences[top_key] = detection.confidence
-        has_ranked_mcap_candidates = len(top_k_confidences) > 1
-        if has_ranked_mcap_candidates:
-            likelihoods = compute_likelihoods(candidates, top_k_confidences, cfg.epsilon)
-            posteriors, best_candidate, max_posterior = compute_posteriors(candidates, likelihoods, trans_p)
+        if det_make and detection.confidence is not None:
+            # This frame's MAKE is still real evidence even when MCAP's exact model
+            # text doesn't match any live candidate (e.g. "Toyota Supra" detected,
+            # only "Toyota GR Supra" lives) -- give every OTHER live same-make
+            # candidate a fraction of this confidence as its likelihood instead of
+            # leaving it at the epsilon floor, so the Bayes posterior below can weigh
+            # this make hint against the accumulated-score prior instead of the
+            # make hint being invisible to it entirely. Never overwrites an existing
+            # entry (an exact match, or real top-k data, is stronger evidence).
+            for r in records:
+                key = r["key"]
+                if key in top_k_confidences:
+                    continue
+                if r["make"] and r["make"].strip().casefold() == det_make.strip().casefold():
+                    top_k_confidences[key] = detection.confidence * cfg.same_make_likelihood_weight
+        # Always fuse this tick's evidence with the transition prior through the same
+        # Bayes update, regardless of how many entries top_k_confidences ended up with.
+        # compute_likelihoods() floors every candidate ABSENT from top_k_confidences at
+        # epsilon -- when top_k_confidences is empty (no detection at all this tick,
+        # e.g. MCAP returned Unknown), that floor is UNIFORM across every candidate, so
+        # the likelihood term is a no-op and the posterior below reduces to exactly
+        # trans_p (renormalized): "no new evidence this tick, carry the prior forward."
+        # That's the correct behavior for a no-read tick -- and it also correctly fuses
+        # the common in-between case (exactly one piece of real evidence, no same-make
+        # rival to pad out a 2nd top_k_confidences entry) through the SAME formula,
+        # instead of a special-cased fallback that discarded trans_p's memory in favor
+        # of comparing only each candidate's current decayed `score`. That fallback let
+        # a single strong misread's score "lock in" as the apparent winner on every
+        # later no-detection tick, with the plate's long-standing true candidate never
+        # getting a chance to be favored again purely because trans_p (which DOES carry
+        # that memory forward) was never consulted.
+        likelihoods = compute_likelihoods(candidates, top_k_confidences, cfg.epsilon)
+        posteriors, best_candidate, max_posterior = compute_posteriors(
+            candidates, likelihoods, trans_p, recency=recency
+        )
 
         # --- 3. apply the observation itself ---
         if is_mmc_detected and top_key:
-            apply_high_confidence_update(records, top_key, detection.confidence, now, cfg.malus_rate)
+            apply_high_confidence_update(records, top_key, detection.confidence, now, cfg.malus_rate, cfg.alpha)
         elif detection.confidence is not None and top_key and any(r["key"] == top_key for r in records):
             winner = next(r for r in records if r["key"] == top_key)
-            apply_low_confidence_update(winner, detection.confidence, cfg.malus_low_rate)
+            apply_low_confidence_update(winner, detection.confidence, cfg.alpha)
 
         scores_after = {r["key"]: r["score"] for r in records}
-        if not has_ranked_mcap_candidates:
-            # The slide flow defines current evidence through score updates. For a
-            # top-1-only response, derive posterior directly from those decayed,
-            # updated Redis scores instead of inventing likelihoods for omitted models.
-            posteriors = compute_pi_score(scores_after, cfg.eps_t)
-            best_candidate, max_posterior = max(posteriors.items(), key=lambda item: item[1])
         for r in records:
             r["posterior"] = posteriors[r["key"]]
 
@@ -232,6 +327,7 @@ class EnrichmentEngine:
             max_posterior=max_posterior,
             scores=scores_after,
             th3=cfg.th3,
+            recency=recency,
         )
 
         # --- 5. persist (unless dry_run) ---

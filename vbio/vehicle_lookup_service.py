@@ -57,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from vbio.clients.mcap_client import MCAPClient, MCAPRequestError, parse_vehicles
 from vbio.clients.query_vbio import VBIoClient
 from vbio.clients.redis_store import InMemoryAssociationStore
+from vbio.enrichment.aliases import MakeModelAliases
 from vbio.enrichment.engine import Detection, EnrichmentEngine, EnrichmentResult
 from vbio.enrichment.keys import normalize_model_key
 from vbio.plate_matching.matcher import match as match_plate_to_vehicle
@@ -83,10 +84,14 @@ class VehicleLookupService:
         mcap_client: MCAPClient,
         vbio_client: VBIoClient,
         engine: Optional[EnrichmentEngine] = None,
+        aliases: Optional[MakeModelAliases] = None,
     ):
         self.mcap_client = mcap_client
         self.vbio_client = vbio_client
         self.engine = engine  # None => build a disposable in-memory one per detection
+        # Only used when building that disposable fallback engine, and to canonicalize
+        # top-k keys below -- an injected `engine` already carries its own aliases.
+        self.aliases = aliases
 
     def lookup_from_image(
         self,
@@ -246,7 +251,7 @@ class VehicleLookupService:
         otherwise builds a disposable in-memory one for just this call (nothing persists,
         and the VBIo parquet file itself is never written to either way).
         """
-        engine = self.engine or EnrichmentEngine(InMemoryAssociationStore())
+        engine = self.engine or EnrichmentEngine(InMemoryAssociationStore(), aliases=self.aliases)
         top_k_confidences = {}
         for row in vehicle.get("makeModelTopK") or []:
             if not isinstance(row, dict):
@@ -254,7 +259,10 @@ class VehicleLookupService:
             conf = row.get("confidence")
             if conf is None:
                 continue
-            key = normalize_model_key(row.get("make"), row.get("model"))
+            row_make, row_model = row.get("make"), row.get("model")
+            if self.aliases is not None:
+                row_make, row_model = self.aliases.canonicalize(row_make, row_model)
+            key = normalize_model_key(row_make, row_model)
             if key == "_":
                 continue
             try:
@@ -317,11 +325,22 @@ def _main():
         "--redis-only", action="store_true",
         help="Read Redis candidates first; seed a cache miss from the local VBIo parquet.",
     )
+    parser.add_argument(
+        "--mapping", default=None,
+        help="Optional path to make_model_mapping.json -- resolves VBIo/MCAP spelling "
+             "variants (e.g. 'Supra' vs 'GR Supra') to one canonical candidate before "
+             "the enrichment engine keys them. See assets/make_model_mapping.json.",
+    )
     parser.add_argument("--out", default=None, help="Optional path to save the JSON result")
     args = parser.parse_args()
 
     if args.redis_only and not args.use_redis:
         parser.error("--redis-only requires --use-redis")
+
+    aliases = None
+    if args.mapping:
+        from vbio.clients.make_model_mapping import load_make_model_aliases
+        aliases = load_make_model_aliases(args.mapping)
 
     engine = None
     vbio_client = VBIoClient(args.parquet)
@@ -330,7 +349,7 @@ def _main():
         from vbio.clients.redis_store import RedisAssociationStore
         redis_client = build_redis_client_for_env(env=args.env, config_path=args.config)
         redis_store = RedisAssociationStore(redis_client)
-        engine = EnrichmentEngine(redis_store)
+        engine = EnrichmentEngine(redis_store, aliases=aliases)
         if args.redis_only:
             from vbio.clients.redis_vbio import RedisVBIoClient
             vbio_client = RedisVBIoClient(redis_store, cold_start_client=vbio_client)
@@ -339,6 +358,7 @@ def _main():
         mcap_client=MCAPClient(config_path=args.config, env=args.env, token=args.token),
         vbio_client=vbio_client,
         engine=engine,
+        aliases=aliases,
     )
 
     component_args = (args.plate_number, args.plate_state, args.plate_image)

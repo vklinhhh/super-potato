@@ -14,7 +14,10 @@ LIKELIHOOD / POSTERIOR"):
   4. posteriors: likelihood * transition_prior, renormalized to sum to 1.
 """
 import math
+from datetime import datetime
 from typing import Dict, Iterable, Optional, Tuple
+
+from .ranking import pick_best_key
 
 
 def compute_t_same_dynamic(n_candidates: int, gap_days: float, t_same_base: float, lambda_base: float) -> float:
@@ -52,16 +55,22 @@ def compute_likelihoods(candidates: Iterable[str], top_k_confidences: Dict[str, 
 
 
 def compute_posteriors(candidates: Iterable[str], likelihoods: Dict[str, float],
-                        transition_prior: Dict[str, float]) -> Tuple[Dict[str, float], Optional[str], float]:
-    """Returns (posteriors, best_candidate_key, max_posterior)."""
+                        transition_prior: Dict[str, float],
+                        recency: Optional[Dict[str, datetime]] = None,
+                        ) -> Tuple[Dict[str, float], Optional[str], float]:
+    """Returns (posteriors, best_candidate_key, max_posterior).
+
+    :param recency: optional {candidate_key: lastSeen} tie-break -- when two
+        candidates land on the exact same posterior (most commonly: tied scores that
+        never got reinforced by a real detection), prefer the one seen more recently
+        instead of silently picking whichever came first in `candidates`' order.
+    """
     candidates = list(candidates)
     raw = {c: likelihoods[c] * transition_prior[c] for c in candidates}
     total = sum(raw.values())
     posteriors = {c: (v / total if total > 0 else transition_prior[c]) for c, v in raw.items()}
 
-    best_candidate, max_posterior = None, -1.0
-    for c in candidates:
-        if posteriors[c] > max_posterior:
-            best_candidate, max_posterior = c, posteriors[c]
-
-    return posteriors, best_candidate, max_posterior
+    if not candidates:
+        return posteriors, None, -1.0
+    best_candidate = pick_best_key(posteriors, recency)
+    return posteriors, best_candidate, posteriors[best_candidate]
