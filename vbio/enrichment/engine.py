@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
 from .aliases import MakeModelAliases
+from .cleanup import gc_and_sync, maybe_promote
 from .config import DEFAULT_CONFIG, EnrichmentConfig
 from .keys import build_redis_key, normalize_model_key
 from .posterior import (
@@ -70,6 +71,16 @@ class EnrichmentResult:
 # vbio.clients.query_vbio.VBIoClient.lookup for a ready-made implementation.
 VBIoSeedFn = Callable[[str, str], List[dict]]
 
+# A vbio_sync_fn is handed the list of VBIo-shaped dicts cleanup.gc_and_sync() produced
+# this tick (see cleanup.py) -- i.e. every OBSERVED+ACTIVE candidate that is about to
+# be evicted from the Redis cache for staleness and therefore needs its facts written
+# somewhere permanent first. Expected to append/upsert these into VBIo (NEVER into the
+# same read path vbio_seed_fn queries from mid-run -- in production this is a real
+# write to the permanent store; in tests, e.g. a brand-new parquet file, never the
+# original vbio.parquet). Optional: if omitted, synced rows are simply discarded along
+# with the cache entry (acceptable for dry runs/previews, not for production use).
+VBIoSyncFn = Callable[[List[dict]], None]
+
 
 class EnrichmentEngine:
     def __init__(
@@ -99,12 +110,17 @@ class EnrichmentEngine:
         return self.aliases.canonicalize(make, model)
 
     def process_detection(self, detection: Detection, vbio_seed_fn: Optional[VBIoSeedFn] = None,
+                           vbio_sync_fn: Optional[VBIoSyncFn] = None,
                            dry_run: bool = False) -> EnrichmentResult:
         """
         :param dry_run: if True, computes and returns the full tiered result WITHOUT
                          writing anything back to the store (no save_candidates, no
-                         set_last_update) -- useful for previewing what the engine
-                         WOULD do before committing to a live Redis instance.
+                         set_last_update, no cache eviction) -- useful for previewing
+                         what the engine WOULD do before committing to a live Redis
+                         instance.
+        :param vbio_sync_fn: see VBIoSyncFn above -- receives any OBSERVED+ACTIVE rows
+                              evicted by this tick's TTL cleanup, for persisting
+                              somewhere permanent before they're gone from the cache.
         """
         cfg = self.config
         now = detection.timestamp or datetime.now(timezone.utc)
@@ -123,6 +139,20 @@ class EnrichmentEngine:
 
         records = self.store.get_candidates(detection.plate_number, detection.plate_state)
 
+        # --- Redis TTL + PENDING -> ACTIVE lifecycle cleanup (cleanup.py) -- run
+        # lazily, right before this tick needs `records`, equivalent to a periodic
+        # sync/cleanup job that happens to always run right before the cache is read.
+        # Never touches source=VBIO records (see cleanup.gc_and_sync()'s docstring).
+        if records:
+            keys_before_gc = {r["key"] for r in records}
+            records, synced_rows = gc_and_sync(records, now, cfg.gc_days)
+            if synced_rows and vbio_sync_fn is not None:
+                vbio_sync_fn(synced_rows)
+            if not dry_run:
+                evicted_keys = keys_before_gc - {r["key"] for r in records}
+                if evicted_keys:
+                    self.store.delete_candidates(list(evicted_keys))
+
         # Cold start: nothing in Redis yet for this plate -- admit VBIo/VBIo seed rows.
         if not records and vbio_seed_fn is not None:
             for seed in vbio_seed_fn(detection.plate_number, detection.plate_state):
@@ -137,6 +167,7 @@ class EnrichmentEngine:
                     "firstSeen": seed.get("FirstSeen") or now,
                     "lastSeen": seed.get("LastSeen") or now,
                     "lastDecayedAt": now,
+                    "lastTouchedAt": seed.get("LastSeen") or now,  # unused for source=VBIO (never GC'd), kept for field consistency
                     "observationCount": seed.get("ObservationCount", 0),
                     "score": cfg.seed_base * (seed.get("HmmPosterior") or 1.0),
                     "posterior": cfg.epsilon,
@@ -195,6 +226,7 @@ class EnrichmentEngine:
                         "firstSeen": seed.get("FirstSeen") or now,
                         "lastSeen": seed.get("LastSeen") or now,
                         "lastDecayedAt": now,
+                        "lastTouchedAt": seed.get("LastSeen") or now,
                         "observationCount": seed.get("ObservationCount", 0),
                         "score": cfg.seed_base * (seed.get("HmmPosterior") or 1.0),
                         "posterior": cfg.epsilon,
@@ -215,15 +247,15 @@ class EnrichmentEngine:
                 "firstSeen": now,
                 "lastSeen": now,
                 "lastDecayedAt": now,
+                "lastTouchedAt": now,
                 "observationCount": 0,
                 "score": 0.0,
                 "posterior": cfg.epsilon,
                 "hmmPosterior": None,  # no VBIo backing for a brand-new sighting
                 # PENDING, not ACTIVE: per the VRDB Plan's admission flow, one high-confidence
                 # read doesn't immediately promote a never-seen-before association -- it still
-                # needs to accumulate observations first. (Dynamic PENDING->ACTIVE promotion
-                # based on a score threshold isn't implemented yet -- this just sets the
-                # correct starting value.)
+                # needs to accumulate observations first. See cleanup.maybe_promote() (called
+                # below, after this tick's update) for the PENDING -> ACTIVE promotion rule.
                 "status": STATUS_PENDING,
                 "source": "OBSERVED",
             })
@@ -313,7 +345,14 @@ class EnrichmentEngine:
             apply_high_confidence_update(records, top_key, detection.confidence, now, cfg.malus_rate, cfg.alpha)
         elif detection.confidence is not None and top_key and any(r["key"] == top_key for r in records):
             winner = next(r for r in records if r["key"] == top_key)
-            apply_low_confidence_update(winner, detection.confidence, cfg.alpha)
+            apply_low_confidence_update(winner, detection.confidence, now, cfg.alpha)
+
+        # PENDING -> ACTIVE promotion (cleanup.py) -- checked for whichever candidate
+        # this tick actually touched, right after its observationCount could have
+        # changed above. No-op for anything other than an OBSERVED candidate still
+        # PENDING with >= cfg.n_activate real confirmations.
+        if top_key and any(r["key"] == top_key for r in records):
+            maybe_promote(next(r for r in records if r["key"] == top_key), cfg.n_activate)
 
         scores_after = {r["key"]: r["score"] for r in records}
         for r in records:

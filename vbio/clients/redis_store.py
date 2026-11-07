@@ -18,7 +18,7 @@ from typing import List, Optional
 
 _NUMERIC_FLOAT_FIELDS = ("score", "posterior", "hmmPosterior", "credibilityScore")
 _NUMERIC_INT_FIELDS = ("observationCount",)
-_DATETIME_FIELDS = ("firstSeen", "lastSeen", "lastDecayedAt")
+_DATETIME_FIELDS = ("firstSeen", "lastSeen", "lastDecayedAt", "lastTouchedAt")
 
 
 def _serialize(record: dict) -> dict:
@@ -69,6 +69,14 @@ class RedisAssociationStore:
         for record in records:
             self.redis.hset(record["key"], mapping=_serialize(record))
 
+    def delete_candidates(self, keys: List[str]) -> None:
+        """Evicts the given candidate hash keys entirely -- used by the enrichment
+        engine's TTL cleanup (see vbio.enrichment.cleanup.gc_and_sync) to reclaim
+        OBSERVED candidates that were never confirmed/promoted within the TTL window.
+        No-op if `keys` is empty."""
+        if keys:
+            self.redis.delete(*keys)
+
     def _meta_key(self, plate_number: str, plate_state: str) -> str:
         return f"vbio:meta:{plate_number.upper()}:{plate_state.upper()}:lastUpdate"
 
@@ -100,6 +108,10 @@ class InMemoryAssociationStore:
     def save_candidates(self, records: List[dict]) -> None:
         for record in records:
             self._records[record["key"]] = dict(record)
+
+    def delete_candidates(self, keys: List[str]) -> None:
+        for key in keys:
+            self._records.pop(key, None)
 
     def get_last_update(self, plate_number: str, plate_state: str) -> Optional[datetime]:
         return self._last_update.get((plate_number.upper(), plate_state.upper()))

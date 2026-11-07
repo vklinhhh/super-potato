@@ -68,6 +68,23 @@ class EnrichmentConfig:
     # literal RFC-01 Th1 for plates that DO have DMV backing. Re-sweep if the test set
     # grows meaningfully; see ENGINE_LOGIC_FLOW.md section 8.
     th1_no_vbio: float = 0.80
+    # Redis-cache TTL for OBSERVED (camera-only, no DMV backing) candidates that are
+    # never reconfirmed -- see cleanup.gc_and_sync(). A plate detected often enough is
+    # unaffected (promotion below kicks in long before this); this only reclaims
+    # candidates that really did turn out to be one-off misreads. 180 days matches the
+    # VRDB Plan doc's own State Lifecycle & Periodical Sync slide. Validated against the
+    # 97-profile harness: +0.73pp over the no-GC baseline (96.07% -> 96.80%), zero new
+    # regressions -- see ENGINE_LOGIC_FLOW.md's "Redis TTL + PENDING -> ACTIVE lifecycle"
+    # section. Re-sweep via scripts/tune_gc_params.py if the test set grows meaningfully.
+    gc_days: float = 180.0
+    # Number of real (high-confidence) confirmations an OBSERVED candidate needs
+    # before cleanup.maybe_promote() flips it PENDING -> ACTIVE (permanent, immune to
+    # gc_days above). Does NOT delay how much a candidate is trusted in score/posterior
+    # comparisons -- those are unaffected by PENDING vs ACTIVE; this only decides
+    # whether an unconfirmed candidate eventually ages out of the cache. 3 matches
+    # RFC-01 Phase 1's own majority-voting N. Re-sweep via scripts/tune_gc_params.py
+    # alongside gc_days if the test set grows meaningfully.
+    n_activate: int = 3
 
 
 DEFAULT_CONFIG = EnrichmentConfig()
