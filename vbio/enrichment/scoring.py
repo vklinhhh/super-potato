@@ -71,7 +71,7 @@ def apply_high_confidence_update(records: List[dict], winner_key: str, confidenc
     """
     conf >= Th1 branch:
         winner.score = alpha * confidence + (1 - alpha) * winner.score  (EMA, bounded)
-        winner.observationCount += 1; winner.lastSeen = now; winner.lastTouchedAt = now
+        winner.observationCount += 1; winner.lastSeen = now
         every OTHER candidate pays a proportional malus: score -= malus_rate * confidence * max(0, score)
     """
     for r in records:
@@ -79,13 +79,12 @@ def apply_high_confidence_update(records: List[dict], winner_key: str, confidenc
             r["score"] = alpha * confidence + (1 - alpha) * r["score"]
             r["observationCount"] = r.get("observationCount", 0) + 1
             r["lastSeen"] = now
-            r["lastTouchedAt"] = now
         else:
             malus = malus_rate * confidence * max(0.0, r["score"])
             r["score"] -= malus
 
 
-def apply_low_confidence_update(record: dict, confidence: float, now: datetime, alpha: float) -> None:
+def apply_low_confidence_update(record: dict, confidence: float, alpha: float) -> None:
     """
     conf < Th1 branch, only applied when the read's top candidate already exists in Redis:
         winner.score = alpha * confidence + (1 - alpha) * winner.score  (same EMA formula
@@ -94,12 +93,5 @@ def apply_low_confidence_update(record: dict, confidence: float, now: datetime, 
         (no malus to others, no admission of new candidates, observationCount unchanged --
         a weak read is activity only, not a confirmed sighting, so lastSeen is unchanged.
         decay_all() has already refreshed lastDecayedAt for every candidate in this lookup.)
-
-    lastTouchedAt IS updated here, unlike lastSeen -- it means "last time ANY detection
-    (any confidence) reinforced this specific candidate", the field cleanup.gc_and_sync()
-    uses for staleness. Anchoring that check on lastSeen instead (which only moves on
-    high-confidence hits) would wrongly flag a candidate under active-but-weak
-    reconfirmation as abandoned -- see ENGINE_LOGIC_FLOW.md's CHC673_OK/Sentra case study.
     """
     record["score"] = alpha * confidence + (1 - alpha) * record["score"]
-    record["lastTouchedAt"] = now

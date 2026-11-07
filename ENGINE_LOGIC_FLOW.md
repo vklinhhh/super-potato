@@ -42,7 +42,6 @@ flowchart LR
 | `posterior` | Xác suất Bayes của candidate này tại lần detect gần nhất |
 | `lastDecayedAt` | Mốc thời gian lần cuối `score` được decay — **riêng cho từng candidate** |
 | `lastSeen` | Lần cuối candidate này thực sự được xác nhận MẠNH (VBIo LastSeen, hoặc lần detect high-confidence gần nhất) — **không** đổi khi chỉ có detect low-confidence |
-| `lastTouchedAt` | **(mới, mục 9)** Lần cuối candidate này được bất kỳ detection nào (mạnh HOẶC yếu) chạm tới — field riêng dùng cho TTL cleanup, khác `lastSeen` ở trên |
 | `firstSeen` | Lần đầu biết đến candidate này |
 | `observationCount` | Số lần được xác nhận bằng detection confidence cao |
 | `status` | `PENDING` (mới, chưa đủ bằng chứng) hoặc `ACTIVE` (đã được promote — xem mục 9; với `source=VBIO` luôn coi là permanent bất kể giá trị field này) |
@@ -53,8 +52,7 @@ flowchart LR
 ```mermaid
 flowchart TD
     S0["Nhận Detection(make, model, confidence, timestamp)"] --> S1["Canonicalize make/model\nqua make_model_mapping.json"]
-    S1 --> SGC["Đọc records từ Redis\n→ chạy GC + sync (mục 9)\ntrước khi dùng tới records"]
-    SGC --> S2{"Redis đã có candidate\ncho Plate+State?"}
+    S1 --> S2{"Redis đã có candidate\ncho Plate+State?\n(key đã TTL-hết-hạn thì Redis tự\nkhông trả về -- xem mục 9)"}
     S2 -- Chưa có --> S3["Cold start:\nseed từ VBIo (canonicalize + build key)\nscore = seed_base(0.7) * HmmPosterior"]
     S2 -- Đã có --> S4["Dùng candidate hiện có"]
     S3 --> S5
@@ -259,7 +257,7 @@ model/platform dễ nhầm (ví dụ GR86 ↔ BRZ) khi MCAP tự tin nhưng sai 
 | `alpha` (α) | **0.3** | Trọng số EMA cho evidence mới: `score = α·confidence + (1-α)·score` (thay thế cách cộng dồn không giới hạn cũ) |
 | `seed_base` | **0.7** | Điểm khởi tạo khi admit candidate từ VBIo (× HmmPosterior) — hạ từ 2.0 để khớp thang EMA |
 | `same_make_likelihood_weight` | 0.5 | Hệ số likelihood cho candidate cùng make, khác model (bổ sung, không thuộc RFC-01 gốc) |
-| `gc_days` | **180.0** | Số ngày `OBSERVED` candidate không được chạm tới (`lastTouchedAt`) trước khi bị coi stale — xem mục 9, fix #9 |
+| `gc_days` | **180.0** | Số giây TTL (`gc_days * 86400`) được arm trên Redis key của 1 candidate `OBSERVED` còn PENDING mỗi lần nó được 1 detection chạm tới — xem mục 9, fix #9 |
 | `n_activate` | **3** | Số lần xác nhận high-confidence để `OBSERVED` candidate được promote PENDING→ACTIVE (miễn trừ TTL) — xem mục 9, fix #9 |
 
 > `alpha`/`seed_base` được tune bằng `scripts/tune_score_params.py` trên tập test 97
@@ -278,7 +276,7 @@ model/platform dễ nhầm (ví dụ GR86 ↔ BRZ) khi MCAP tự tin nhưng sai 
 | 6 | Decay bỏ qua khi plate chỉ có 1 candidate | `scoring.py` (`decay_all`) | Nếu MCAP chưa từng train để nhận ra 1 make/model, candidate VBIo tương ứng không bao giờ được xác nhận lại → decay đều đặn sẽ xóa nó khỏi mọi so sánh Bayes chỉ sau ~1.8 năm (xem mục 5.1), dù đúng 100%. Giờ: không có đối thủ thật → không decay. Khi có candidate thứ 2 xuất hiện, decay resume bình thường. Test: net +1/4506, 0 regression |
 | 7 | `th1_no_vbio` — Th1 động theo VBIo backing | `config.py`, `engine.py` | Plate chưa từng có candidate VBIo không có gì để neo khi chờ 1 lần đọc đạt Th1=0.90 — make/model đúng lặp lại nhất quán ở confidence trung bình (0.54-0.80, case `CHC673_OK`) không bao giờ được admit, trong khi 1 lần đọc SAI (platform dễ nhầm) đạt ≥0.90 lại được tin ngay. Hạ Th1 xuống 0.80 **chỉ** cho plate 0-VBIo-backing (check `any(source=="VBIO")`, miễn phí, không cần lưu trữ thêm). Test: +69/4506, **0 regression** |
 | 8 | "Late-arriving VBIo rescue" | `engine.py` | Plate ĐÃ có VBIo (xe cũ) nên `th1_no_vbio` không áp dụng — nhưng xe MỚI (sau crossover) tuy đã có trong VBIo lại "lỡ" cold-start (chạy đúng 1 lần, ở detection đầu tiên của profile) vì registration của nó tới SAU mốc đó. MCAP phải tự đạt Th1=0.90 mới admit được, mất nhiều tháng (case `HMU4444_NY`: Mazda→Nissan, mất ~8 tháng). Giờ: khi gặp `(make,model)` chưa khớp candidate nào, kiểm tra lại VBIo riêng cho đúng cặp đó (không seed lại toàn bộ, chỉ gọi khi gặp cặp mới — hiếm, không phải mỗi tick); nếu VBIo xác nhận hợp lệ tới `now`, admit thẳng `source=VBIO`, không cần qua Th1. Test: **+43/4506** (7 profile cải thiện), **1 regression nhỏ** (`GRS1894_PA` -1, do 2 candidate VBIo cùng năm đăng ký) |
-| 9 | Redis TTL + PENDING→ACTIVE lifecycle | `cleanup.py`, `scoring.py`, `config.py`, `engine.py`, `clients/redis_store.py` | `OBSERVED` candidate rác (misread 1 lần, không bao giờ confirm lại) tích lũy vô hạn trong Redis và vẫn tham gia mọi so sánh mãi mãi. Thêm field `lastTouchedAt` (update ở cả 2 nhánh update, khác `lastSeen` chỉ update ở nhánh high-confidence) + luật GC chỉ áp dụng cho `source=OBSERVED` (không bao giờ đụng `VBIO`) + promotion PENDING→ACTIVE sau `n_activate` (3) lần xác nhận. Xem mục 9 để biết chi tiết đầy đủ. Test: **+53/4506** so với baseline không-GC (96.07% → 96.80%), **0 regression** |
+| 9 | Redis TTL (native) + PENDING→ACTIVE lifecycle | `cleanup.py`, `config.py`, `engine.py`, `clients/redis_store.py` | `OBSERVED` candidate rác (misread 1 lần, không bao giờ confirm lại) tích lũy vô hạn trong Redis và vẫn tham gia mọi so sánh mãi mãi. `store.set_ttl()`/`store.persist()` (native Redis `EXPIRE`/`PERSIST`, không scan) chỉ áp dụng cho `source=OBSERVED` (không bao giờ đụng `VBIO`) + promotion PENDING→ACTIVE sau `n_activate` (3) lần xác nhận. Xem mục 9 để biết chi tiết đầy đủ (kể cả bản v1 scan thủ công đã thử và bỏ). Test: **+30/4506** so với baseline không-GC (96.07% → 96.74%), **0 regression** |
 
 **Accuracy tích lũy qua các fix (chạy `scripts/test_phase2_accuracy.py` trên 97 profile,
 4506 record):** 85.60% (gốc) → 86.46% (fix 1) → 88.57% (tie-break) → 88.70% (same-make
@@ -287,12 +285,12 @@ bằng kết quả `vbio/plate_matching/matcher.py` chạy trực tiếp trên `
 thay đổi DỮ LIỆU test, không phải fix code) → 92.74% (fix 7) → 94.47% (sau khi review tay
 bằng `tools/mcap_review_tool.html` + sửa plate-mapping) → 94.67% (sau
 `scripts/clean_freshmcap_data.py`) → 95.12% (gộp "Supra"/"GR Supra" trong
-`make_model_mapping.json`) → 96.07% (fix 8) → **96.80% (fix 9 — Redis TTL + PENDING→ACTIVE
-lifecycle, hiện tại)**. Fix #5 không đổi tổng accuracy trên tập test lúc đó (net 0, nhưng
+`make_model_mapping.json`) → 96.07% (fix 8) → **96.74% (fix 9 — Redis TTL (native) +
+PENDING→ACTIVE lifecycle, hiện tại)**. Fix #5 không đổi tổng accuracy trên tập test lúc đó (net 0, nhưng
 sửa đúng 1 lỗi đã chứng minh bằng case `9F84204_CA`) — xem lịch sử commit/hội thoại để
 biết chi tiết từng bước.
 
-## 9. Cơ chế dọn rác — Redis TTL + PENDING → ACTIVE lifecycle (fix #9, `cleanup.py`)
+## 9. Cơ chế dọn rác — Redis TTL (native) + PENDING → ACTIVE lifecycle (fix #9, `cleanup.py`)
 
 **Vấn đề:** MCAP nhận nhầm make/model là bình thường (noise của vision model). Mỗi lần
 nhận nhầm đủ mạnh (≥ Th1 hiệu lực) hiện tại đều tạo ra 1 candidate `OBSERVED` mới trong
@@ -300,29 +298,41 @@ Redis. Nếu không có gì dọn lại, Redis phình to vô hạn theo thời g
 rác này vẫn tham gia vào mọi so sánh score/posterior mãi mãi — kể cả khi chưa từng được
 xác nhận lại lần nào sau đó.
 
-**Ràng buộc khi thiết kế (đã raise trong lúc brainstorm, quan trọng để hiểu vì sao thiết
-kế ra như vậy):**
-- Không tạo thêm 1 Redis key/structure mới chỉ để track "độ rác" — tốn thêm cost vận
-  hành. Giải pháp dùng field có sẵn (`status`) + 1 field mới duy nhất (`lastTouchedAt`,
-  cùng 1 hash record, không phải key riêng).
-- Không được anchor "còn sống hay không" vào `lastSeen`/`observationCount` — cả 2 field
-  này **chỉ** update ở nhánh high-confidence (xem mục 5.3/8). Một candidate đang được
-  xác nhận lại liên tục nhưng YẾU (dưới Th1) sẽ bị tưởng là "bị bỏ rơi" nếu dùng `lastSeen`
-  làm mốc — case thật đã gặp lúc thử nghiệm: `CHC673_OK`'s Nissan Sentra, đọc lại liên tục
-  ở 0.54-0.80 (không chạm `lastSeen`) nhưng vẫn là candidate ĐÚNG đang sống. → Phải có
-  field riêng (`lastTouchedAt`) chỉ dùng cho mục đích TTL, update ở CẢ 2 nhánh update.
+**v1 (đã bỏ) — scan thủ công mỗi tick:** bản đầu tiên chạy 1 hàm quét (`cleanup.gc_and_sync()`)
+ngay đầu `process_detection()`, tự tính staleness qua 1 field riêng (`lastTouchedAt`) và
+tự evict/sync. Bị chính người dùng chỉ ra lỗi thiết kế: hàm này **chỉ** chạy khi biển số
+đó được detect lại — nếu 1 biển số **biến mất hoàn toàn** (xe bán đi, camera không còn
+chụp được), `process_detection()` của nó không bao giờ được gọi lại, nên rác của nó
+**không bao giờ bị dọn**. Đây lại chính là trường hợp quan trọng nhất mà TTL cần giải
+quyết (rác từ biển số đã "chết"), và v1 hoàn toàn bỏ lỡ nó — nó là "lazy GC on access",
+không phải "periodical sync"/TTL thật.
+
+**v2 (hiện tại) — Redis TTL thuần (`EXPIRE`/`PERSIST`) ở tầng storage:** không scan,
+không cần field `lastTouchedAt` nữa (Redis tự đếm ngược TTL nội bộ, không cần ta tự tính
+lại). `engine.py` chỉ gọi 2 lệnh storage ở bước ⑤ (persist), cho ĐÚNG candidate vừa được
+tick này chạm tới (`top_key`):
+```
+record.source != VBIO  AND  record.status == ACTIVE   -> store.persist(key)   # bỏ TTL hẳn, vĩnh viễn
+record.source == OBSERVED  AND  record.status == PENDING
+   AND record.key == top_key (vừa được chạm tick này)  -> store.set_ttl(key, now, gc_days*86400)
+(mọi candidate KHÁC không bị chạm tick này -- không gọi gì cả, TTL cũ của nó
+ (được arm từ 1 tick trước đó) tiếp tục đếm ngược không bị xáo trộn)
+```
+Redis tự xóa key khi TTL về 0, **không cần job quét, không cần biết "có solo hay không"**
+— đây chính là khác biệt quan trọng với v1: Redis xóa key dựa trên CHÍNH key đó, không
+biết gì về các candidate khác cùng biển số, nên **không còn ngoại lệ "giữ lại nếu solo"**
+như v1 từng có. Đánh đổi này được chấp nhận có chủ đích (xem bảng kết quả dưới) — 1
+candidate solo, thật, chưa từng confirm lại trong `gc_days` ngày vẫn có thể bị Redis xóa;
+nếu biển số đó xuất hiện lại sau đó, engine admit lại từ đầu bình thường (hành vi tương
+đương "để nó decay về 0 mãi mãi", chỉ khác là Redis thật sự giải phóng được RAM).
 
 ```mermaid
 flowchart TD
-    G0["Đọc records từ Redis cho plate này\n(trước khi cold-start/admission)"] --> G1{"record.source == VBIO?"}
-    G1 -- Có --> GKeep["Giữ nguyên, không bao giờ đụng tới\n(VBIo đã có backing vĩnh viễn ở vbio.parquet)"]
-    G1 -- Không (OBSERVED) --> G2{"now - lastTouchedAt > gc_days (180)?"}
-    G2 -- Chưa stale --> GKeep2["Giữ nguyên"]
-    G2 -- Stale --> G3{"status == ACTIVE?"}
-    G3 -- Có --> G4["SYNC: ghi ra VBIo-row-shaped dict\n(vbio_sync_fn) rồi EVICT khỏi Redis"]
-    G3 -- Không (PENDING) --> G5{"Biển số còn ≥2\ncandidate (không solo)?"}
-    G5 -- Có --> G6["EVICT thẳng, không sync\n(chưa từng được promote → rác thật)"]
-    G5 -- Không (solo) --> GKeep3["Giữ nguyên — cùng lý do\ndecay_all() bỏ qua decay khi solo (mục 5.1):\nkhông có đối thủ để 'thua điểm' thì staleness\nkhông phải bằng chứng để loại bỏ"]
+    P0["Bước ⑤ persist (mỗi tick,\nchỉ xét record vừa bị update)"] --> P1{"source != VBIO\nAND status == ACTIVE?"}
+    P1 -- Có --> P2["store.persist(key)\n-> bỏ TTL hẳn, vĩnh viễn trong cache"]
+    P1 -- Không --> P3{"source == OBSERVED\nAND status == PENDING\nAND key == top_key?"}
+    P3 -- Có --> P4["store.set_ttl(key, now, gc_days*86400)\n-> Redis tự xóa key nếu không ai\nchạm lại nó trong gc_days ngày,\nKỂ CẢ KHI biển số không bao giờ\nđược detect lại"]
+    P3 -- Không --> P5["Không làm gì -- TTL cũ (nếu có)\ncủa record này tiếp tục đếm ngược"]
 ```
 
 **PENDING → ACTIVE promotion (`cleanup.maybe_promote()`):** chạy ngay sau bước ③ (áp dụng
@@ -330,59 +340,54 @@ observation), cho đúng candidate vừa được tick này chạm tới:
 ```
 nếu record.source == OBSERVED AND record.status == PENDING
    AND record.observationCount >= n_activate (3):
-      record.status = ACTIVE   # vĩnh viễn, miễn trừ TTL ở trên
+      record.status = ACTIVE   # -> persist() ở bước ⑤, vĩnh viễn, miễn trừ TTL
 ```
 **Quan trọng:** promotion này **không** đổi trọng số của candidate trong bất kỳ so sánh
 score/posterior/tier nào — PENDING và ACTIVE cạnh tranh ngang nhau ở mọi nơi khác trong
-engine. Tác dụng DUY NHẤT của `ACTIVE` là được miễn trừ TTL ở sơ đồ trên. Nhờ vậy:
-- 1 xe hiếm, thật, đọc đúng ngay lần đầu vẫn được tin **toàn bộ, ngay lập tức** — giống
-  hệt hiện tại, không hề bị trì hoãn (tránh đúng rủi ro "Low-Frequency Vehicle starvation"
-  mà RFC-01 Phase 1 documented, và mà 1 ý tưởng PENDING/ACTIVE-để-giảm-trọng-số khác đã
-  bị bác bỏ trước đó trong quá trình brainstorm vì tái tạo lại đúng rủi ro này).
-- Nó chỉ có nguy cơ bị TTL quét nếu **không bao giờ** được xác nhận lại trong `gc_days`
-  ngày — hành vi tương đương để nó decay về gần 0 mãi mãi (file vẫn đúng về logic), chỉ
-  khác là TTL thật sự giải phóng được dung lượng Redis.
+engine. Tác dụng DUY NHẤT của `ACTIVE` là được `persist()` (miễn trừ TTL) ở sơ đồ trên.
+Nhờ vậy 1 xe hiếm, thật, đọc đúng ngay lần đầu vẫn được tin **toàn bộ, ngay lập tức** —
+giống hệt hiện tại, không hề bị trì hoãn (tránh đúng rủi ro "Low-Frequency Vehicle
+starvation" mà RFC-01 Phase 1 documented, và mà 1 ý tưởng PENDING/ACTIVE-để-giảm-trọng-số
+khác đã bị bác bỏ trước đó trong quá trình brainstorm vì tái tạo lại đúng rủi ro này).
 
-**"Sync" khi evict 1 candidate ACTIVE:** 1 candidate `OBSERVED` dù đã ACTIVE vẫn chưa có
-backing nào ngoài Redis (khác `VBIO`, đã có `vbio.parquet`) — nên trước khi evict, dữ
-liệu của nó được đưa qua tham số tùy chọn mới `vbio_sync_fn` (dict dạng VBIo row:
-`PlateNumber/PlateState/Make/Model/FirstSeen/LastSeen/ObservationCount/HmmPosterior/Status`)
-để caller tự ghi vào nơi vĩnh viễn (ví dụ: 1 bảng/job sync VBIo thật, hoặc — như lúc test
-thiết kế này — ghi ra **1 file parquet MỚI**, KHÔNG BAO GIỜ ghi đè `vbio.parquet` gốc).
-Nếu không truyền `vbio_sync_fn`, các dòng này đơn giản bị bỏ (được phép cho dry-run/preview,
-không nên dùng cho production thật).
+**"Sync" OBSERVED+ACTIVE ra VBIo:** v1 có `vbio_sync_fn` để ghi dữ liệu ra trước khi evict
+(vì v1 EVICT candidate ACTIVE khi stale). v2 **không cần nữa** — `persist()` không bao giờ
+tự xóa key, nên 1 candidate ACTIVE chỉ còn "mồ côi" trong cache (giống VBIo) mãi mãi,
+không mất dữ liệu, không cần đồng bộ ngay trong hot path. Việc đưa nó vào `vbio.parquet`
+thật (nếu muốn) có thể làm bằng 1 job batch hoàn toàn riêng, độc lập, không ảnh hưởng tới
+`process_detection()` — ngoài phạm vi code hiện tại.
 
 **Kết quả test (97 profile, `gc_days=180`, `n_activate=3`; re-sweep bằng
-`scripts/tune_gc_params.py`):**
+`scripts/tune_gc_params.py`, dùng `InMemoryAssociationStore` có simulate TTL thật qua
+`now` — xem `clients/redis_store.py`):**
 
 | Variant | Accuracy | Ghi chú |
 |---|---|---|
 | Baseline (không GC/promotion) | 96.07% | |
-| **GC + promotion (giữ nguyên Th1-gate hiện tại)** | **96.80%** (+0.73pp, **0 regression**) | 13 candidate rác bị evict, 17 được promote ACTIVE, 8 bản ACTIVE được sync+evict vì stale |
-| GC + promotion + bỏ luôn Th1-admission-gate (ý tưởng brainstorm khác, test cùng lúc để so sánh) | 93.25% (**-2.82pp**) | 117 candidate rác được admit (so với 35) — **bác bỏ** ý tưởng bỏ Th1-gate bằng số liệu, dù có lưới an toàn GC |
+| v1 (scan thủ công mỗi tick, có ngoại lệ "giữ nếu solo") | 96.80% (+0.73pp) | Đã bỏ — chỉ dọn được rác của biển số CÒN được detect lại |
+| **v2 (native TTL, hiện tại)** | **96.74%** (+0.67pp, so với baseline) | -6 record so với v1 (mất ngoại lệ "giữ nếu solo"), nhưng dọn được ĐÚNG cả case biển số bị bỏ hoàn toàn mà v1 không làm được |
 
-→ Chỉ áp dụng phần GC+promotion, **giữ nguyên Th1-admission-gate** như hiện tại (mục 3/6).
-Lý do accuracy TĂNG dù chỉ là dọn rác (không phải fix logic tính điểm): loại bỏ các
-candidate `OBSERVED` đã "chết" (chưa từng được xác nhận lại) khỏi tập so sánh giúp quy
-tắc "bỏ qua decay khi solo" (mục 5.1) áp dụng đúng và thường xuyên hơn cho candidate còn
-sống, thay vì bị 1 rival rác tồn tại dai dẳng trong so sánh.
+→ Chênh lệch nhỏ (6/4506 record) giữa v1 và v2 là chi phí hợp lý để đổi lấy 1 thiết kế
+đúng nghĩa "TTL ở tầng storage" + xử lý được case biển số bị bỏ hoàn toàn — điều v1
+không bao giờ làm được dù accuracy đo trên 97-profile (vốn không có biển số "chết hẳn"
+giữa test) nhìn cao hơn 1 chút.
 
-**1 lỗi đã gặp và sửa khi implement (đáng ghi lại):** phiên bản đầu áp luật "evict nếu
-`status==ACTIVE` và stale" cho **mọi** `source`, không lọc riêng `OBSERVED` — vì seed
-thật từ `vbio.parquet` production sẵn có field `Status=ACTIVE`. Kết quả: 889 candidate
-`VBIO` hợp lệ (chỉ đang "ngủ" lâu) bị evict nhầm khỏi cache, kéo accuracy xuống 95.30%.
-Sửa: `gc_and_sync()` luôn kiểm tra `source != "OBSERVED"` **đầu tiên** và bỏ qua record
-đó hoàn toàn — VBIo không bao giờ cần hoặc nên bị TTL này đụng tới. Tham số `gc_days`/
-`n_activate` — xem bảng ở mục 7.
+**1 lỗi đã gặp và sửa khi implement v1 (đáng ghi lại dù v1 đã bỏ):** bản đầu của
+`gc_and_sync()` áp luật "evict nếu `status==ACTIVE` và stale" cho **mọi** `source`, không
+lọc riêng `OBSERVED` — vì seed thật từ `vbio.parquet` production sẵn có field
+`Status=ACTIVE`. Kết quả: 889 candidate `VBIO` hợp lệ (chỉ đang "ngủ" lâu) bị evict nhầm
+khỏi cache, kéo accuracy xuống 95.30%. v2 giữ nguyên bài học này: `persist()`/`set_ttl()`
+luôn kiểm tra `source != "VBIO"` trước — VBIo không bao giờ cần hoặc nên bị TTL này đụng
+tới. Tham số `gc_days`/`n_activate` — xem bảng ở mục 7.
 
 ## 10. Việc CHƯA làm (để code lại trên production cần biết)
 
 - **Issue #1 (OBSERVED bypass):** chưa sửa — xem mục 6.
-- **`vbio_sync_fn` (mục 9) chưa được wire vào bất kỳ hệ thống thật nào** — hiện tại chỉ là
-  1 callback tùy chọn trong `process_detection()`. Production cần implement 1 hàm thật (ghi
-  vào VBIo/DB thật), và quyết định xem có cần batch/retry/at-least-once delivery không
-  (hiện tại: nếu `vbio_sync_fn` raise exception hoặc không được truyền, các dòng ACTIVE đó
-  coi như mất — candidate vẫn bị evict khỏi Redis dù sync thất bại).
+- **Chưa có job đồng bộ candidate `OBSERVED+ACTIVE` vào `vbio.parquet` thật** (mục 9) —
+  với TTL native hiện tại, 1 candidate ACTIVE chỉ `persist()` (miễn trừ TTL) và nằm lại
+  trong Redis vĩnh viễn như 1 record "mồ côi" (không mất dữ liệu, nhưng cũng chưa thành
+  DMV record thật). Nếu muốn đưa vào VBIo thật, cần 1 job batch riêng (quét
+  `source=OBSERVED AND status=ACTIVE`, ghi ra VBIo, không đụng tới `process_detection()`).
 - **Không có lớp SQL Server / persistence lâu dài** theo đúng RFC-01 (mục "SQL Server
   Write-Gating", "Multi-Candidate 1-to-N") — toàn bộ state hiện chỉ sống trong Redis + seed
   tĩnh từ VBIo parquet. Xem `PHASE2_REVIEW.md` để biết chi tiết so sánh với RFC-01 Phase 2.
